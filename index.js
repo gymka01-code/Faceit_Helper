@@ -1,18 +1,7 @@
-/**
- * index.js — FACEIT Telegram Notifier Backend
- *
- * Endpoints:
- *   POST /webhook              — Telegram webhook (принимает апдейты)
- *   POST /api/send             — Расширение → отправить сообщение/фото в TG
- *   GET  /api/poll/:sessionId  — Расширение → получить команды (нажатия кнопок)
- *   GET  /api/status/:sessionId — Расширение → статус привязки
- *   POST /api/setup-webhook    — Один раз: зарегистрировать webhook в Telegram
- */
-
 import 'dotenv/config';
-import express        from 'express';
-import cors           from 'cors';
-import FormData       from 'form-data';
+import express   from 'express';
+import cors      from 'cors';
+import FormData  from 'form-data';
 
 const app    = express();
 const PORT   = process.env.PORT   || 3000;
@@ -26,31 +15,39 @@ if (!SECRET) throw new Error('API_SECRET not set in .env');
 app.use(cors());
 app.use(express.json({ limit: '20mb' }));
 
-// ─── Хранилище (in-memory, можно заменить на Redis/SQLite) ─────────────────
+// ─── Хранилище ─────────────────────────────────────────────────────────────
 
-/**
- * sessions: Map<sessionId, { chatId, nickname, boundAt }>
- * Хранит привязки UUID расширения → Telegram chat_id
- */
-const sessions = new Map();
+const sessions      = new Map(); // sessionId → { chatId, nickname, boundAt }
+const commandQueues = new Map(); // sessionId → [{action, payload, timestamp}]
+const settingsStore = new Map(); // sessionId → settings object
 
-/**
- * commandQueues: Map<sessionId, Array<{action, payload, timestamp}>>
- * Очередь команд от Telegram → расширению
- */
-const commandQueues = new Map();
+const DEFAULT_SETTINGS = {
+  notifyMatchFound:    true,
+  notifyLobby:         true,
+  notifyVeto:          true,
+  notifyBanScreenshots: true,
+};
 
-// ─── Авторизация расширений ────────────────────────────────────────────────
+function getSettings(sessionId) {
+  return { ...DEFAULT_SETTINGS, ...(settingsStore.get(sessionId) || {}) };
+}
+
+function saveSettings(sessionId, patch) {
+  const current = getSettings(sessionId);
+  const updated  = { ...current, ...patch };
+  settingsStore.set(sessionId, updated);
+  return updated;
+}
+
+// ─── Авторизация ───────────────────────────────────────────────────────────
 
 function authMiddleware(req, res, next) {
-  const secret = req.headers['x-api-secret'];
-  if (secret !== SECRET) {
+  if (req.headers['x-api-secret'] !== SECRET)
     return res.status(401).json({ ok: false, error: 'Unauthorized' });
-  }
   next();
 }
 
-// ─── Telegram API хелперы ──────────────────────────────────────────────────
+// ─── Telegram helpers ──────────────────────────────────────────────────────
 
 async function tgRequest(method, body = {}) {
   const res = await fetch(`https://api.telegram.org/bot${TOKEN}/${method}`, {
@@ -71,127 +68,140 @@ async function tgSendPhoto(chatId, photoBuffer, caption = '') {
   form.append('caption', caption);
   form.append('parse_mode', 'HTML');
   form.append('photo', photoBuffer, { filename: 'screenshot.png', contentType: 'image/png' });
-
   const res = await fetch(`https://api.telegram.org/bot${TOKEN}/sendPhoto`, {
-    method: 'POST',
-    body:   form,
+    method: 'POST', body: form,
   });
   return res.json();
 }
 
-async function tgAnswerCallback(callbackQueryId, text = '') {
-  return tgRequest('answerCallbackQuery', { callback_query_id: callbackQueryId, text });
+async function tgAnswerCallback(id, text = '') {
+  return tgRequest('answerCallbackQuery', { callback_query_id: id, text });
 }
 
 async function tgEditMessageReplyMarkup(chatId, messageId, replyMarkup) {
   return tgRequest('editMessageReplyMarkup', {
-    chat_id:      chatId,
-    message_id:   messageId,
-    reply_markup: replyMarkup,
+    chat_id: chatId, message_id: messageId, reply_markup: replyMarkup,
   });
+}
+
+async function tgEditMessageText(chatId, messageId, text, extra = {}) {
+  return tgRequest('editMessageText', {
+    chat_id: chatId, message_id: messageId, text, ...extra,
+  });
+}
+
+// ─── Клавиатура настроек ───────────────────────────────────────────────────
+
+function buildSettingsKeyboard(settings) {
+  const on  = (v) => v ? '✅' : '☑️';
+  return {
+    inline_keyboard: [
+      [{ text: `${on(settings.notifyMatchFound)} Матч найден`,    callback_data: 'SETTING:notifyMatchFound' }],
+      [{ text: `${on(settings.notifyLobby)} Анализ лобби`,        callback_data: 'SETTING:notifyLobby' }],
+      [{ text: `${on(settings.notifyVeto)} Фаза вето`,            callback_data: 'SETTING:notifyVeto' }],
+      [{ text: `${on(settings.notifyBanScreenshots)} Скриншоты банов`, callback_data: 'SETTING:notifyBanScreenshots' }],
+    ],
+  };
+}
+
+function buildSettingsText(settings) {
+  const s = (v) => v ? 'вкл' : '<b>выкл</b>';
+  return [
+    '⚙️ <b>Настройки уведомлений</b>',
+    '',
+    `🎮 Матч найден — ${s(settings.notifyMatchFound)}`,
+    `📋 Анализ лобби — ${s(settings.notifyLobby)}`,
+    `🗺️ Фаза вето — ${s(settings.notifyVeto)}`,
+    `📸 Скриншоты банов — ${s(settings.notifyBanScreenshots)}`,
+    '',
+    'Нажми на кнопку чтобы переключить:',
+  ].join('\n');
 }
 
 // ─── Очереди команд ────────────────────────────────────────────────────────
 
 function enqueueCommand(sessionId, command) {
-  if (!commandQueues.has(sessionId)) {
-    commandQueues.set(sessionId, []);
-  }
-  commandQueues.get(sessionId).push({
-    ...command,
-    timestamp: Date.now(),
-  });
-
-  // Чистим старые команды (> 5 минут)
-  const queue = commandQueues.get(sessionId);
+  if (!commandQueues.has(sessionId)) commandQueues.set(sessionId, []);
+  const queue  = commandQueues.get(sessionId);
   const cutoff = Date.now() - 5 * 60 * 1000;
+  queue.push({ ...command, timestamp: Date.now() });
   commandQueues.set(sessionId, queue.filter(c => c.timestamp > cutoff));
 }
 
 function dequeueCommands(sessionId) {
   const queue = commandQueues.get(sessionId) || [];
-  commandQueues.set(sessionId, []); // очищаем после получения
+  commandQueues.set(sessionId, []);
   return queue;
 }
 
-// ─── Webhook: апдейты от Telegram ─────────────────────────────────────────
+// ─── Webhook ───────────────────────────────────────────────────────────────
 
 app.post('/webhook', async (req, res) => {
-  res.sendStatus(200); // быстро отвечаем Telegram
-
+  res.sendStatus(200);
   const update = req.body;
-
-  // Обработка callback_query (нажатие inline-кнопки)
-  if (update.callback_query) {
-    await handleCallbackQuery(update.callback_query);
-    return;
-  }
-
-  // Обработка сообщений
-  if (update.message) {
-    await handleMessage(update.message);
-  }
+  if (update.callback_query) await handleCallbackQuery(update.callback_query);
+  else if (update.message)   await handleMessage(update.message);
 });
 
 async function handleMessage(msg) {
   const chatId = msg.chat.id;
   const text   = msg.text || '';
 
-  // /start <sessionId> — привязка расширения
   if (text.startsWith('/start')) {
-    const parts     = text.split(' ');
-    const sessionId = parts[1];
-
+    const sessionId = text.split(' ')[1];
     if (sessionId && sessionId.length > 10) {
-      // Привязываем session к этому chat_id
       sessions.set(sessionId, {
         chatId,
         nickname: msg.from.first_name || msg.from.username || 'User',
         boundAt:  Date.now(),
       });
-
       await tgSendMessage(chatId,
-        `✅ <b>FACEIT Notifier подключён!</b>\n\nТеперь уведомления о матчах будут приходить сюда.\n\n/help — список команд`,
-        { parse_mode: 'HTML' }
-      );
+        `✅ <b>FACEIT Notifier подключён!</b>\n\nТеперь уведомления о матчах будут приходить сюда.\n\n/settings — настройки уведомлений\n/help — список команд`,
+        { parse_mode: 'HTML' });
       return;
     }
-
-    // /start без кода — просто приветствие
     await tgSendMessage(chatId,
       `👋 Привет! Я FACEIT Notifier.\n\nЧтобы привязать расширение:\n1. Установи расширение в браузер\n2. Нажми кнопку "Подключить Telegram"\n\n/help — список команд`,
-      { parse_mode: 'HTML' }
-    );
+      { parse_mode: 'HTML' });
     return;
   }
 
-  // /help
   if (text === '/help') {
     await tgSendMessage(chatId,
-      `📖 <b>Команды</b>\n\n/status — статус подключения\n/unbind — отвязать расширение\n/help — эта справка`,
-      { parse_mode: 'HTML' }
-    );
+      `📖 <b>Команды</b>\n\n/settings — настройки уведомлений\n/status — статус подключения\n/unbind — отвязать расширение\n/help — эта справка`,
+      { parse_mode: 'HTML' });
     return;
   }
 
-  // /status
+  if (text === '/settings') {
+    const entry = [...sessions.entries()].find(([, v]) => v.chatId === chatId);
+    if (!entry) {
+      await tgSendMessage(chatId, '❌ Расширение не привязано.');
+      return;
+    }
+    const [sessionId] = entry;
+    const settings = getSettings(sessionId);
+    await tgSendMessage(chatId, buildSettingsText(settings), {
+      parse_mode:   'HTML',
+      reply_markup: JSON.stringify(buildSettingsKeyboard(settings)),
+    });
+    return;
+  }
+
   if (text === '/status') {
-    // Ищем session по chat_id
     const entry = [...sessions.entries()].find(([, v]) => v.chatId === chatId);
     if (entry) {
       const [sessionId, data] = entry;
       const boundDate = new Date(data.boundAt).toLocaleString('ru-RU');
       await tgSendMessage(chatId,
         `✅ <b>Подключено</b>\nSession: <code>${sessionId.slice(0, 8)}…</code>\nПривязано: ${boundDate}`,
-        { parse_mode: 'HTML' }
-      );
+        { parse_mode: 'HTML' });
     } else {
-      await tgSendMessage(chatId, '❌ Расширение не привязано. Установи расширение и нажми "Подключить Telegram".');
+      await tgSendMessage(chatId, '❌ Расширение не привязано.');
     }
     return;
   }
 
-  // /unbind
   if (text === '/unbind') {
     const entry = [...sessions.entries()].find(([, v]) => v.chatId === chatId);
     if (entry) {
@@ -206,32 +216,46 @@ async function handleMessage(msg) {
 async function handleCallbackQuery(cq) {
   const chatId    = cq.message.chat.id;
   const messageId = cq.message.message_id;
-  const data      = cq.data; // "action:payload"
+  const data      = cq.data;
 
   await tgAnswerCallback(cq.id);
 
-  // Находим session по chat_id
   const entry = [...sessions.entries()].find(([, v]) => v.chatId === chatId);
   if (!entry) {
-    await tgSendMessage(chatId, '❌ Расширение не привязано или не запущено.');
+    await tgSendMessage(chatId, '❌ Расширение не привязано.');
     return;
   }
 
   const [sessionId] = entry;
-  const [action, payload] = data.split(':', 2);
 
-  // Кладём команду в очередь для расширения
-  enqueueCommand(sessionId, { action, payload });
+  // Переключение настройки
+  if (data.startsWith('SETTING:')) {
+    const key      = data.split(':')[1];
+    const current  = getSettings(sessionId);
+    const updated  = saveSettings(sessionId, { [key]: !current[key] });
 
-  // Убираем кнопки у сообщения чтобы не нажали дважды
-  const shouldRemoveButtons = ['ACCEPT_MATCH', 'BAN_MAP', 'BAN_SERVER', 'PICK_MAP'].includes(action);
-  if (shouldRemoveButtons) {
+    // Обновляем сообщение с настройками
     try {
-      await tgEditMessageReplyMarkup(chatId, messageId, { inline_keyboard: [] });
+      await tgEditMessageText(chatId, messageId, buildSettingsText(updated), {
+        parse_mode:   'HTML',
+        reply_markup: JSON.stringify(buildSettingsKeyboard(updated)),
+      });
     } catch (_) {}
+
+    // Посылаем команду расширению обновить настройки
+    enqueueCommand(sessionId, { action: 'SETTINGS_UPDATED', payload: JSON.stringify(updated) });
+    return;
   }
 
-  // Подтверждение пользователю
+  // Остальные команды
+  const [action, payload] = data.split(':', 2);
+  enqueueCommand(sessionId, { action, payload });
+
+  const shouldRemoveButtons = ['ACCEPT_MATCH', 'BAN_MAP', 'BAN_SERVER', 'PICK_MAP'].includes(action);
+  if (shouldRemoveButtons) {
+    try { await tgEditMessageReplyMarkup(chatId, messageId, { inline_keyboard: [] }); } catch (_) {}
+  }
+
   const confirmMessages = {
     ACCEPT_MATCH: '⏳ Принимаю матч...',
     BAN_MAP:      `⏳ Баню карту ${payload}...`,
@@ -239,97 +263,79 @@ async function handleCallbackQuery(cq) {
     PICK_MAP:     `⏳ Пикаю карту ${payload}...`,
     OPEN_ROOM:    '🔗 Открываю комнату в браузере...',
   };
-
   const confirmText = confirmMessages[action];
-  if (confirmText) {
-    await tgSendMessage(chatId, confirmText);
-  }
+  if (confirmText) await tgSendMessage(chatId, confirmText);
 }
 
-// ─── API: Расширение → отправить сообщение ─────────────────────────────────
+// ─── API: send ──────────────────────────────────────────────────────────────
 
 app.post('/api/send', authMiddleware, async (req, res) => {
   const { sessionId, type, text, photo, caption, keyboard } = req.body;
-
   const session = sessions.get(sessionId);
-  if (!session) {
-    return res.status(404).json({ ok: false, error: 'Session not found or not bound' });
-  }
-
-  const { chatId } = session;
+  if (!session) return res.status(404).json({ ok: false, error: 'Session not found' });
 
   try {
     let result;
-
     if (type === 'photo' && photo) {
-      // photo — base64 строка
-      const buffer = Buffer.from(photo, 'base64');
-      result = await tgSendPhoto(chatId, buffer, caption || '');
+      result = await tgSendPhoto(session.chatId, Buffer.from(photo, 'base64'), caption || '');
     } else {
-      // Текстовое сообщение
       const extra = { parse_mode: 'HTML' };
       if (keyboard) extra.reply_markup = JSON.stringify(keyboard);
-      result = await tgSendMessage(chatId, text, extra);
+      result = await tgSendMessage(session.chatId, text, extra);
     }
-
     res.json({ ok: true, result });
   } catch (e) {
-    console.error('[Server] Send error:', e);
     res.status(500).json({ ok: false, error: e.message });
   }
 });
 
-// ─── API: Расширение → получить команды ───────────────────────────────────
+// ─── API: poll ──────────────────────────────────────────────────────────────
 
 app.get('/api/poll/:sessionId', authMiddleware, (req, res) => {
   const { sessionId } = req.params;
-
   const session = sessions.get(sessionId);
-  if (!session) {
-    return res.json({ ok: true, bound: false, commands: [] });
-  }
+  if (!session) return res.json({ ok: true, bound: false, commands: [], settings: DEFAULT_SETTINGS });
 
   const commands = dequeueCommands(sessionId);
-  res.json({ ok: true, bound: true, commands });
+  const settings = getSettings(sessionId);
+  res.json({ ok: true, bound: true, commands, settings });
 });
 
-// ─── API: Расширение → статус привязки ────────────────────────────────────
+// ─── API: status ────────────────────────────────────────────────────────────
 
 app.get('/api/status/:sessionId', (req, res) => {
   const { sessionId } = req.params;
   const session = sessions.get(sessionId);
-  res.json({
-    ok:    true,
-    bound: !!session,
-    boundAt: session?.boundAt || null,
-  });
+  res.json({ ok: true, bound: !!session, boundAt: session?.boundAt || null });
 });
 
-// ─── Регистрация webhook ───────────────────────────────────────────────────
+// ─── API: settings ──────────────────────────────────────────────────────────
+
+app.get('/api/settings/:sessionId', authMiddleware, (req, res) => {
+  res.json({ ok: true, settings: getSettings(req.params.sessionId) });
+});
+
+app.post('/api/settings/:sessionId', authMiddleware, (req, res) => {
+  const updated = saveSettings(req.params.sessionId, req.body);
+  res.json({ ok: true, settings: updated });
+});
+
+// ─── API: setup-webhook ─────────────────────────────────────────────────────
 
 app.post('/api/setup-webhook', async (req, res) => {
-  const secret = req.headers['x-api-secret'];
-  if (secret !== SECRET) return res.status(401).json({ ok: false });
-
-  const webhookUrl = `${SERVER}/webhook`;
+  if (req.headers['x-api-secret'] !== SECRET) return res.status(401).json({ ok: false });
   const result = await tgRequest('setWebhook', {
-    url:             webhookUrl,
+    url: `${SERVER}/webhook`,
     allowed_updates: ['message', 'callback_query'],
   });
-
   console.log('[Server] Webhook setup:', result);
   res.json(result);
 });
 
-// ─── Health check ──────────────────────────────────────────────────────────
+// ─── Health ─────────────────────────────────────────────────────────────────
 
-app.get('/', (req, res) => {
-  res.json({ ok: true, sessions: sessions.size });
-});
-
-// ─── Старт ────────────────────────────────────────────────────────────────
+app.get('/', (req, res) => res.json({ ok: true, sessions: sessions.size }));
 
 app.listen(PORT, () => {
   console.log(`[Server] Running on port ${PORT}`);
-  console.log(`[Server] Set webhook: POST ${SERVER}/api/setup-webhook`);
 });
